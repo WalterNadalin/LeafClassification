@@ -14,6 +14,10 @@ library(rpart)       # Direct engine for decision tree application
 library(caret)       # For resampling and model training
 library(ipred)       # For fitting bagged decision trees
 library(ranger)      # A c++ implementation of random forest 
+library(mlbench)
+library(tuneRanger)
+library(mlr) 
+
 
 # Model interpretability packages
 library(vip)      # For feature importance
@@ -46,49 +50,92 @@ names(leaves) <- features
 
 leaves <- leaves %>% select(-Specimen_Number)
 
-## DROPPING PARAMETERS ########################################################
-s = 30
-err <- c()
-all.err <- c()
-for(i in 1:1) {
-   fit <- ranger(
-    Species ~ ., 
-    #data = leaves, 
-    data = leaves %>% select(-Smoothness, -Average_Contrast),
-    mtry = 3, # Number of features considered: 3
-    respect.unordered.factors = "order",
-    num.trees = 140,
-    min.node.size = 1,
-    sample.fraction = 1,
-    seed = s
-  )
-  
-  err[i] <- fit$prediction.error
-  
-  fit.all <- ranger(
-    Species ~ ., 
-    data = leaves, 
-    mtry = 3, # Number of features considered: 3
-    respect.unordered.factors = "order",
-    num.trees = 140,
-    min.node.size = 1,
-    sample.fraction = 1,
-    seed = s
-  )
-  
-  all.err[i] <- fit.all$prediction.error
-}
 
-sum(err > all.err)
-length(err > all.err)
+## FEATURE SELECTION ##########################################################
+names(leaves) <- formatted.features
 
-leaves <- leaves %>% select(-Smoothness, -Average_Contrast)
+n_features <- length(setdiff(names(leaves), "Species"))
+rf.impurity <- ranger(
+  formula = Species ~ ., 
+  data = leaves, # %>% select(-Smoothness, -Maximal_Indentation_Depth,
+  #            -Average_Contrast, -Average_Intensity), 
+  num.trees = 500,
+  mtry = floor(sqrt(n_features)),
+  min.node.size = 1,
+  sample.fraction = 1,
+  replace = TRUE,
+  importance = "impurity",
+  respect.unordered.factors = "order",
+  verbose = FALSE,
+  seed  = 4
+)
+
+# re-run model with permutation-based variable importance
+rf.permutation <- ranger(
+  formula = Species ~ ., 
+  data = leaves, # %>% select(-Smoothness, -Maximal_Indentation_Depth,
+  #            -Average_Contrast, -Average_Intensity), 
+  num.trees = 500,
+  mtry = floor(sqrt(n_features)),
+  min.node.size = 1,
+  sample.fraction = 1,
+  replace = TRUE,
+  importance = "permutation",
+  respect.unordered.factors = "order",
+  verbose = FALSE,
+  seed  = 4
+)
+
+var.imp.impurity <- vip::vip(rf.impurity, num_features = 14, geom = "point")
+var.imp.permutation <- vip::vip(rf.permutation, num_features = 14, 
+                                geom = "point")
+
+gridExtra::grid.arrange(var.imp.impurity, var.imp.permutation, nrow = 1)
+
+formatted.features <- c("Species", "Eccentricity", "Aspect.ratio", "Elongation",
+                        "Solidity", "St.convexity", 
+                        "Is.factor", "Max.ind.depth",
+                        "Lobedness", "Av.intensity", "Av.contrast", 
+                        "Smoothness",  "Third.moment", "Uniformity", "Entropy") 
+
+names(leaves) <- formatted.features
+M <- cor(leaves %>% select(Smoothness, Av.intensity, Av.contrast, Third.moment,
+                           Solidity, Is.factor, Max.ind.depth, Lobedness))
+
+x11()
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+p.mat <- cor.mtest(leaves %>% select(-Species))
+# corrplot(M, type="upper", order="hclust", tl.col="black", tl.srt=45, diag = FALSE)
+corrplot(M, method = "color", col = col(200), diag = FALSE, type = "upper",
+         order = "hclust",  addCoef.col = "black", tl.col = "black",
+         tl.srt = 45)
+
+names(leaves)  <- c('Species', 'Eccentricity', 'Aspect_Ratio', 
+                    'Elongation', 'Solidity', 'Stochastic_Convexity', 
+                    'Isoperimetric_Factor', 'Maximal_Indentation_Depth', 'Lobedness', 
+                    'Average_Intensity', 'Average_Contrast', 'Smoothness', 
+                    'Third_moment', 'Uniformity', 'Entropy')
+
+# RFE
+s <- 4
+set.seed(s) # For reproducibility
+control <- rfeControl(functions = rfFuncs, method = "cv", number = 5)
+# run the RFE algorithm
+results <- rfe(leaves %>% select(-Species), leaves$Species, sizes=c(1:14),
+               rfeControl = control)
+# summarize the results
+print(results)
+# list the chosen features
+predictors(results)
+# plot the results
+plot(results, type = c("g", "o"))
+
+leaves <- leaves %>% select(Species, predictors(results))
 
 ### SIMPLE RANDOM SPLITTING ###################################################
-
 # Using rsample package
 set.seed(s) # For reproducibility
-leaves.split <- initial_split(leaves, prop = 0.8)
+leaves.split <- initial_split(leaves, prop = 0.7)
 leaves.train <- training(leaves.split)
 leaves.test <- testing(leaves.split)
 
@@ -96,14 +143,13 @@ leaves.test <- testing(leaves.split)
 
 # Create a resampling method
 cv <- trainControl(
-  method = "repeatedcv", 
-  number = 5, 
-  repeats = 10
+  method = "cv", 
+  number = 5
 )
 
 # Using only the training data
 set.seed = s
-tree.leaves.train <- train(
+tree.leaves.train <- caret::train(
   Species ~ .,
   data = leaves.train,
   method = "rpart",
@@ -120,43 +166,25 @@ mean(tree.predict != leaves.test$Species)
 bag.leaves.train <- bagging(
   formula = Species ~ .,
   data = leaves.train,
-  nbagg = 200,  
+  nbagg = 500,  
   coob = TRUE,
   control = rpart.control(minsplit = 2, cp = 0),
   seed = s
 )
+
 bag.leaves.train$err
 bag.predict <- predict(bag.leaves.train, newdata = leaves.test)
 mean(bag.predict != leaves.test$Species)
 
-# For plotting
-bag.error <- c()
-j <- 1;
-for (i in seq(from = 1930, to = 2000, by = 10)) {
-  fit  <- bagging(
-    formula = Species ~ .,
-    data = leaves,
-    nbagg = i,  
-    coob = TRUE,
-    control = rpart.control(minsplit = 2, cp = 0),
-    seed = s
-  )
-  
-  bag.error[j] <- fit$err
-  j <- j + 1
-}
-
-bag.error
-
 ## CROSS-VALIDATION ###########################################################
-bag.leaves.cv.train <- train(
-  seed = s,
+bag.leaves.cv.train <- caret::train(
   Species ~ .,
   data = leaves.train,
   method = "treebag",
   trControl = cv,
-  nbagg = 200,  
-  control = rpart.control(minsplit = 2, cp = 0)
+  nbagg = 500,  
+  control = rpart.control(minsplit = 2, cp = 0),
+  seed = s
 )
 
 1 - bag.leaves.cv.train$results$Accuracy
@@ -165,93 +193,49 @@ mean(bag.predict != leaves.test$Species)
 
 # RANDOM FOREST ###############################################################
 
-rf.leaves.train <- ranger(
-  Species ~ ., 
-  data = leaves,
-  mtry = 3, # Number of features considered
-  respect.unordered.factors = "order",
-  seed = 1,
-  num.trees = 120,
-  replace = TRUE,
-  min.node.size = 1,
-  sample.fraction = 1,
-)
-
-default.err <- rf.leaves.train$prediction.error
-
 ## TUNING PARAMETERS ##########################################################
 # Size
-rf.error <- c()
-j <- 1
-for (i in seq(from = 10, to = 2000, by = 10)) {
-  fit <- ranger(
-    formula         = Species ~ ., 
-    data = leaves,
-    num.trees       = i,
-    mtry            = 3,
-    min.node.size   = 1,
-    replace         = TRUE,
-    sample.fraction = 1,
-    verbose         = FALSE,
-    seed            = 4,
-    respect.unordered.factors = 'order',
-  )
-  # Exports OOB error
-  rf.error[j] <- fit$prediction.error
-  j <- j + 1
-}
 
-plot(seq(from = 10, to = 2000, by = 10), rf.error, type = 'l', col = 'red',
-     ylab = 'OOB error estimate', xlab = 'Number of trees')
-points(seq(from = 10, to = 2000, by = 10), bag.error, type = 'l', col = 'green')
-legend(x = 1300, y = 0.39, legend = c('Bag of trees', 'Random forest'), 
-       lty = c(1, 1), col = c('green', 'red'))
-# abline(h = tree.error, lty = 'dashed', col = 'red')
+# A mlr task has to be created in order to use the package
+# We make an mlr task with the iris dataset here 
+# (Classification task with makeClassifTask, Regression Task with makeRegrTask)
+set.seed(s)
+leaves.task = makeClassifTask(data = leaves, target = "Species")
 
-# Execute full cartesian grid search
-hyper_grid <- expand.grid(
-  mtry = seq(from = 1, to = 10),
-  min.node.size =seq(from = 1, to = 10),
-  num.trees = 1500,
-  err = NA
-)
+# Rough Estimation of the Tuning time
+estimateTimeTuneRanger(leaves.task)
 
-for(i in seq_len(nrow(hyper_grid))) {
-  # Fit model for ith hyperparameter combination
-  fit <- ranger(
-    formula         = Species ~ ., 
-    data = leaves,
-    num.trees       = hyper_grid$num.trees[i],
-    mtry            = hyper_grid$mtry[i],
-    min.node.size   = hyper_grid$min.node.size[i],
-    replace         = TRUE,
-    sample.fraction = 1,
-    verbose         = FALSE,
-    seed            = s,
-    respect.unordered.factors = 'order',
-  )
-  # Exports OOB error 
-  hyper_grid$err[i] <- fit$prediction.error
-}
+# Tuning process (takes around 1 minute); Tuning measure is the multiclass brier score
+res = tuneRanger(leaves.task, num.trees = 1500, measure = list(multiclass.brier),
+                 num.threads = 8, iters = 100, 
+                 parameters = list(replace = TRUE, respect.unordered.factors = "order"),
+                 tune.parameters = c("mtry", "min.node.size", "sample.fraction"))
 
-# Assess top 10 models
-hyper_grid %>%
-  arrange(err) %>%
-  mutate(perc_gain = (default.err - err)) %>%
-  head(10)
 
+# Mean of best 5 % of the results
+res
+# Model with the new tuned hyperparameters
+res$model
+# Restart after failing in one of the iterations:
+res = restartTuneRanger("./optpath.RData", leaves.task, measure = list(multiclass.brier))
+
+## TRAINING ###################################################################
 # Training the random forst
 # Train a default random forest model
+m = 11
+node.size = 2
+fraction = 1
+rep = TRUE
 rf.leaves.train <- ranger(
   Species ~ ., 
   data = leaves.train,
-  mtry = 5, # Number of features considered
+  mtry = m, # Number of features considered
   respect.unordered.factors = "order",
   seed = s,
   num.trees = 1500,
-  replace = TRUE,
-  min.node.size = 1,
-  sample.fraction = 1,
+  replace = rep,
+  min.node.size = node.size,
+  sample.fraction = fraction,
 )
 
 # Get OOB accuracy
@@ -259,18 +243,19 @@ rf.leaves.train$prediction.error
 rf.predict <- predict(rf.leaves.train, leaves.test)
 mean(rf.predict$predictions != leaves.test$Species)
 
-rf_grid <- expand.grid(mtry = 5,
-                       min.node.size = 1,
+rf_grid <- expand.grid(mtry = m,
+                       min.node.size = node.size,
                        splitrule = "gini")
 
-rf.leaves.cv <- train(
+rf.leaves.cv <- caret::train(
   Species ~ .,
-  data = leaves.train,# %>% select(-Smoothness, -Average_Contrast, 
-  #             -Average_Intensity),
+  data = leaves.train,
   method = "ranger",
   trControl = cv,
   tuneGrid = rf_grid,
   num.trees = 1500,
+  sample.fraction = fraction,
+  replace = rep,
   respect.unordered.factors = "order",
   seed = s,
 )
@@ -282,13 +267,14 @@ mean(rf.predict != leaves.test$Species)
 rf.leaves <- ranger(
   Species ~ ., 
   data = leaves,
-  mtry = 5, # Number of features considered
+  mtry = m, # Number of features considered
   respect.unordered.factors = "order",
   seed = s,
   num.trees = 1500,
-  replace = TRUE,
-  min.node.size = 1,
-  sample.fraction = 1,
+  replace = rep,
+  min.node.size = node.size,
+  sample.fraction = fraction,
 )
 
 rf.leaves$prediction.error
+
