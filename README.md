@@ -1,4 +1,4 @@
-# LeafClassification
+# Leaf classification
 *Machine Learning project - Master Degree in Data Science and Scientific Computing*
 
 The purpose of this project is to implement an automatic method to classify certain leaves based on some of their attributes. The leaves and attributes
